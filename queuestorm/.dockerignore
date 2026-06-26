@@ -1,0 +1,33 @@
+# Secrets — NEVER bake into the image
+.env
+.env.*
+!.env.example
+
+# Python caches / build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# VCS / IDE / OS
+.git/
+.gitignore
+.idea/
+.vscode/
+*.log
+.DS_Store
+Thumbs.db
+
+# Docs / build artifacts not needed at runtime
+README.md
+HANDOFF.md
+Dockerfile

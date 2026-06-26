@@ -59,14 +59,13 @@ async def health() -> dict:
 
 
 @app.post("/analyze-ticket", response_model=TicketResponse)
-def analyze_ticket(ticket: TicketRequest) -> TicketResponse:
+async def analyze_ticket(ticket: TicketRequest) -> TicketResponse:
     """Investigate a support ticket and return a structured verdict.
 
-    Declared as a *sync* function on purpose: FastAPI runs sync routes in a worker
-    thread, so the (currently stubbed, later blocking LLM) investigation never
-    blocks the event loop.
+    Declared async: analyze() awaits the LLM text-generation step (with a hard
+    10s timeout and an always-safe fallback), so it must run on the event loop.
     """
-    return analyze(ticket)
+    return await analyze(ticket)
 
 
 # --------------------------------------------------------------------------- #
@@ -76,7 +75,9 @@ def _field_names(errors) -> list:
     """Collect offending field names (safe to expose) from validation errors."""
     names = []
     for err in errors:
-        parts = [str(p) for p in err.get("loc", ()) if p != "body"]
+        # Skip "body" and integer loc parts (list indices / JSON decode positions);
+        # keep only real field names so a malformed body doesn't surface a stray "0".
+        parts = [str(p) for p in err.get("loc", ()) if p != "body" and not isinstance(p, int)]
         name = ".".join(parts)
         if name and name not in names:
             names.append(name)
@@ -128,16 +129,19 @@ async def request_validation_handler(request: Request, exc: RequestValidationErr
 
 @app.exception_handler(ValueError)
 async def value_error_handler(request: Request, exc: ValueError):
-    """Semantic errors raised by our own logic (e.g. inside analyze()).
+    """Semantic errors raised by our own business logic during a request.
 
-    Contract: only raise ValueError with safe, user-facing messages — the text is
-    returned to the caller. Anything unexpected should propagate to the 500 handler.
+    The raw exception text is NEVER returned to the client (it could carry
+    internal detail); it is logged server-side only, and the caller gets a fixed,
+    safe message. Pydantic validator ValueErrors take the RequestValidationError
+    path above, not this one.
     """
+    logger.warning("ValueError processing %s %s", request.method, request.url.path, exc_info=True)
     return JSONResponse(
         status_code=422,
         content=ErrorResponse(
             error="unprocessable_entity",
-            detail=str(exc) or "The request could not be processed.",
+            detail="The request could not be processed.",
         ).model_dump(),
     )
 

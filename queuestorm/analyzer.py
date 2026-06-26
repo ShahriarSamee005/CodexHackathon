@@ -1,4 +1,9 @@
-"""Core investigation logic: rule-based cross-referencing of complaint against transaction data. No LLM calls.
+"""Core investigation logic: rule-based cross-referencing of complaint against transaction data.
+
+All DECISIONS (matching, verdict, classification, severity, routing, confidence,
+reason_codes) are pure rule-based code. The LLM is used ONLY to write the three
+free-text fields (agent_summary / recommended_next_action / customer_reply) via
+llm.get_text_fields_safe, which falls back to safe templates on any failure.
 
 PHASE 2 — deterministic extraction utilities. Everything here is pure Python:
 given untrusted complaint text, pull out the few hard signals we can verify
@@ -20,9 +25,21 @@ from datetime import datetime
 from typing import List, Literal, Optional
 
 try:  # package-relative import (e.g. `uvicorn queuestorm.main:app`)
+    from .llm import get_text_fields_safe
     from .models import TicketRequest, TicketResponse, TransactionEntry
+    from .safety import (
+        SAFE_FALLBACK_REPLY,
+        is_prompt_injection,
+        sanitize_recommended_action,
+    )
 except ImportError:  # pragma: no cover - flat-script import (e.g. `python main.py`)
+    from llm import get_text_fields_safe
     from models import TicketRequest, TicketResponse, TransactionEntry
+    from safety import (
+        SAFE_FALLBACK_REPLY,
+        is_prompt_injection,
+        sanitize_recommended_action,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -155,12 +172,18 @@ _CASE_RULES = [
     ("duplicate_payment", "payments_ops",
      ["twice", "double", "duplicate", "charged twice", "two times",
       "দুইবার", "দুবার", "আবার কাটা"]),
+    # A merchant *settlement* complaint usually also says "not received" — which is
+    # a payment_failed keyword. Check the strong, unambiguous "settlement" signal
+    # FIRST so these route to merchant_operations, not payments_ops. (Bare
+    # "merchant"/"shop" stay at the lower-priority rule below, so "shop payment
+    # failed" still classifies as payment_failed.)
+    ("merchant_settlement_delay", "merchant_operations",
+     ["merchant settlement", "settlement", "সেটেলমেন্ট"]),
     ("payment_failed", "payments_ops",
      ["failed", "not received", "deducted", "not credited", "balance cut",
       "কাটা গেছে", "পাইনি", "ব্যর্থ"]),
     ("merchant_settlement_delay", "merchant_operations",
-     ["merchant", "settlement", "shop", "store", "business",
-      "মার্চেন্ট", "সেটেলমেন্ট"]),
+     ["merchant", "shop", "store", "business", "মার্চেন্ট"]),
     ("agent_cash_in_issue", "agent_operations",
      ["agent", "cash in", "deposit", "not reflected", "জমা", "এজেন্ট", "ক্যাশ ইন"]),
     ("refund_request", "dispute_resolution",
@@ -616,156 +639,146 @@ def classify_case(
 
 
 # --------------------------------------------------------------------------- #
-# Response composition (deterministic, NO LLM). The three free-text fields use #
-# safe templates: they never ask for a PIN/OTP/password/card, never promise a  #
-# refund/reversal/unblock/recovery, and never refer to third parties. The LLM  #
-# phase will enrich this text and safety.py will sanitize it.                   #
+# Confidence score (deterministic).                                           #
 # --------------------------------------------------------------------------- #
-_CUSTOMER_REPLY = {
-    "phishing_or_social_engineering": (
-        "Thank you for letting us know. Your account safety is our priority. Please "
-        "avoid sharing any verification codes or account credentials with anyone who "
-        "contacts you. We have escalated this to our fraud and risk team, who will "
-        "review it and reach out if anything further is needed."
-    ),
-    "wrong_transfer": (
-        "Thank you for reporting this. We understand the transfer may not have reached "
-        "the intended recipient. We've logged the details and our dispute resolution "
-        "team will review the transaction and follow up with the next steps."
-    ),
-    "duplicate_payment": (
-        "Thanks for flagging this. We've noted your concern about being charged more "
-        "than once, and our payments team will review the transaction records and "
-        "follow up with an update."
-    ),
-    "payment_failed": (
-        "Thank you for reaching out. We've recorded your report about this payment and "
-        "our payments team will review what happened with the transaction. We'll get "
-        "back to you with an update."
-    ),
-    "merchant_settlement_delay": (
-        "Thanks for getting in touch. We've noted your concern about the merchant "
-        "settlement and our merchant operations team will look into the transaction "
-        "timeline and follow up with an update."
-    ),
-    "agent_cash_in_issue": (
-        "Thank you for letting us know. We've recorded the details of your agent "
-        "cash-in and our agent operations team will review the transaction and follow "
-        "up with the next steps."
-    ),
-    "refund_request": (
-        "Thank you for reaching out. We've recorded your request and the relevant team "
-        "will review the transaction details and follow up with you on the next steps."
-    ),
-    "other": (
-        "Thank you for contacting us. We've received your message and a support agent "
-        "will review the details and follow up with you."
-    ),
-}
-# Internal routing/verification guidance only — no customer-facing promises.
-_NEXT_ACTION = {
-    "phishing_or_social_engineering": (
-        "Escalate to fraud_risk for social-engineering review; do not take account "
-        "actions without identity verification."
-    ),
-    "wrong_transfer": (
-        "Route to dispute_resolution to verify recipient details and follow the "
-        "wrong-transfer procedure."
-    ),
-    "duplicate_payment": (
-        "Route to payments_ops to check the referenced transaction(s) for duplicate "
-        "processing."
-    ),
-    "payment_failed": "Route to payments_ops to reconcile the payment status against the ledger.",
-    "merchant_settlement_delay": (
-        "Route to merchant_operations to review the settlement timeline for the "
-        "referenced merchant."
-    ),
-    "agent_cash_in_issue": "Route to agent_operations to verify the agent cash-in posting.",
-    "refund_request": "Route to dispute_resolution to review the request against refund policy.",
-    "other": "Route to customer_support for manual review.",
-}
-_CASE_READABLE = {
-    "phishing_or_social_engineering": "possible phishing / social engineering",
-    "wrong_transfer": "wrong transfer",
-    "duplicate_payment": "possible duplicate payment",
-    "payment_failed": "payment failure",
-    "merchant_settlement_delay": "merchant settlement delay",
-    "agent_cash_in_issue": "agent cash-in issue",
-    "refund_request": "refund request",
-    "other": "general inquiry",
-}
+def calculate_confidence(
+    verdict: str,
+    matched_id: Optional[str],
+    case_type: str,
+) -> float:
+    """Map the (verdict, match) outcome to a confidence score.
 
-
-def _find_txn_by_id(
-    transactions: List[TransactionEntry],
-    txn_id: Optional[str],
-) -> Optional[TransactionEntry]:
-    """Return the TransactionEntry whose id matches txn_id, or None."""
-    if txn_id is None:
-        return None
-    for txn in transactions:
-        if txn.transaction_id == txn_id:
-            return txn
-    return None
-
-
-# --------------------------------------------------------------------------- #
-# Investigation entry point — orchestrates the rule-based pipeline (no LLM).    #
-# --------------------------------------------------------------------------- #
-def analyze(ticket: TicketRequest) -> TicketResponse:
-    """Run the full rule-based investigation and compose the structured verdict.
-
-    Pipeline: find_relevant_transaction -> get_evidence_verdict -> classify_case,
-    then deterministic, safety-compliant text composition. No LLM calls.
+    `case_type` is accepted for signature stability / forward use but does not
+    currently affect the score.
     """
-    complaint = ticket.complaint
-    transactions = ticket.transaction_history or []
+    if verdict == "consistent" and matched_id:
+        return 0.90
+    elif verdict == "inconsistent" and matched_id:
+        return 0.75
+    elif verdict == "insufficient_data" and matched_id:
+        return 0.60
+    else:
+        return 0.45
 
-    matched_id = find_relevant_transaction(complaint, transactions)
-    matched_txn = _find_txn_by_id(transactions, matched_id)
 
-    verdict = get_evidence_verdict(complaint, matched_txn)
-    case_type, department, severity, human_review_required, reason_codes = classify_case(
-        complaint, matched_txn, verdict
+# --------------------------------------------------------------------------- #
+# Enum safety net — allowed values mirror models.py.                          #
+# --------------------------------------------------------------------------- #
+_ALLOWED_VERDICT = {"consistent", "inconsistent", "insufficient_data"}
+_ALLOWED_CASE_TYPE = {
+    "wrong_transfer", "payment_failed", "refund_request", "duplicate_payment",
+    "merchant_settlement_delay", "agent_cash_in_issue",
+    "phishing_or_social_engineering", "other",
+}
+_ALLOWED_DEPARTMENT = {
+    "customer_support", "dispute_resolution", "payments_ops",
+    "merchant_operations", "agent_operations", "fraud_risk",
+}
+_ALLOWED_SEVERITY = {"low", "medium", "high", "critical"}
+
+
+def _coerce_enum(value, allowed, default):
+    """Return value if it is an allowed enum member, else the safe default.
+
+    A defensive net so a future bug yielding an out-of-set value degrades the
+    response gracefully instead of raising a Pydantic ValidationError (500).
+    """
+    return value if value in allowed else default
+
+
+# --------------------------------------------------------------------------- #
+# Investigation entry point — rule-based logic + LLM text generation.          #
+#                                                                              #
+# ALL decisions (matching, verdict, classification, severity, routing,         #
+# confidence, reason_codes) are computed deterministically here. The LLM        #
+# (llm.get_text_fields_safe) ONLY writes the three free-text fields and falls   #
+# back to safe templates on any failure. Every customer-facing string is then   #
+# re-checked by safety.py before it leaves this function.                       #
+# --------------------------------------------------------------------------- #
+async def analyze(request: TicketRequest) -> TicketResponse:
+    """Investigate a ticket and compose the structured verdict.
+
+    Logic is pure code; only the three text fields are LLM-generated (with a
+    deterministic, always-safe fallback). The complaint is untrusted throughout:
+    it never influences verdict / enum / safety decisions — only keyword matching.
+    """
+    # STEP 1 — Injection check FIRST. Flags only; never alters the investigation.
+    injection = is_prompt_injection(request.complaint)
+
+    # STEP 2 — Transaction matching (pure code). Coerce any falsy id ("" / missing)
+    # to real None so the response shows JSON null, never an empty string.
+    txns = request.transaction_history or []
+    matched_id = find_relevant_transaction(request.complaint, txns) or None
+    matched_txn = (
+        next((t for t in txns if t.transaction_id == matched_id), None)
+        if matched_id else None
     )
 
-    # Internal, factual summary for the support agent.
-    if matched_txn is not None:
-        evidence_line = (
-            f"Matched transaction {matched_txn.transaction_id} "
-            f"(type {matched_txn.type or 'unknown'}, amount {matched_txn.amount}, "
-            f"status {matched_txn.status or 'unknown'})."
-        )
-    else:
-        evidence_line = "No transaction in the provided history matched the complaint."
-    agent_summary = (
-        f"Case: {_CASE_READABLE.get(case_type, case_type)}. "
-        f"Evidence verdict: {verdict}. Severity: {severity}. {evidence_line}"
-        + (" Human review required." if human_review_required else "")
+    # STEP 3 — Evidence verdict (pure code).
+    verdict = get_evidence_verdict(request.complaint, matched_txn)
+
+    # STEP 4 — Case classification (pure code). classify_case also returns its own
+    # reason codes (5th element); we merge those with safety codes in STEP 7.
+    case_type, department, severity, human_review, classification_codes = classify_case(
+        request.complaint, matched_txn, verdict
     )
 
-    # Confidence is a heuristic placeholder (the LLM phase may refine it).
-    if matched_txn is None:
-        confidence = 0.35
-    elif verdict == "consistent":
-        confidence = 0.85
-    elif verdict == "inconsistent":
-        confidence = 0.80
-    else:
-        confidence = 0.50
+    # STEP 5 — Confidence score (pure code).
+    confidence = calculate_confidence(verdict, matched_id, case_type)
 
+    # STEP 6 — Generate the three text fields (LLM, with automatic safe fallback).
+    # get_text_fields_safe sanitizes the customer_reply itself and returns any
+    # safety violations it found in the GENERATED reply, so we can surface them in
+    # reason_codes (an unsafe LLM reply is flagged; a plain fallback is not).
+    text_fields, violations = await get_text_fields_safe(
+        complaint=request.complaint,
+        case_type=case_type,
+        evidence_verdict=verdict,
+        department=department,
+        severity=severity,
+        matched_txn=matched_txn.model_dump() if matched_txn else None,
+        human_review_required=human_review,
+    )
+    safe_reply = text_fields["customer_reply"]  # already safety-filtered upstream
+
+    # STEP 7 — Sanitize the internal recommended action too (the LLM wrote it).
+    safe_action = sanitize_recommended_action(text_fields["recommended_next_action"])
+
+    # Merge reason codes: safety codes ALWAYS survive (they go first), and the
+    # soft cap expands to fit them so classification codes are trimmed first.
+    safety_codes: list[str] = []
+    if injection:
+        safety_codes.append("prompt_injection_detected")
+    if violations:
+        safety_codes.append("safety_filter_triggered")
+        safety_codes.extend(violations[:2])
+    reason_codes = list(dict.fromkeys(safety_codes + list(classification_codes)))
+    reason_codes = reason_codes[: max(4, len(safety_codes))]
+
+    # STEP 8 — On injection, force the safe fallback reply regardless of output.
+    if injection:
+        safe_reply = SAFE_FALLBACK_REPLY
+
+    # STEP 8.5 — Enum safety net. The decisions above always produce valid enums,
+    # but coerce defensively so any out-of-set value degrades to a safe default
+    # rather than raising a 500 at response construction.
+    verdict = _coerce_enum(verdict, _ALLOWED_VERDICT, "insufficient_data")
+    case_type = _coerce_enum(case_type, _ALLOWED_CASE_TYPE, "other")
+    department = _coerce_enum(department, _ALLOWED_DEPARTMENT, "customer_support")
+    severity = _coerce_enum(severity, _ALLOWED_SEVERITY, "medium")
+
+    # STEP 9 — Build and return the response.
     return TicketResponse(
-        ticket_id=ticket.ticket_id,
+        ticket_id=request.ticket_id,
         relevant_transaction_id=matched_id,
         evidence_verdict=verdict,
         case_type=case_type,
         severity=severity,
         department=department,
-        agent_summary=agent_summary,
-        recommended_next_action=_NEXT_ACTION.get(case_type, _NEXT_ACTION["other"]),
-        customer_reply=_CUSTOMER_REPLY.get(case_type, _CUSTOMER_REPLY["other"]),
-        human_review_required=human_review_required,
+        agent_summary=text_fields["agent_summary"],
+        recommended_next_action=safe_action,
+        customer_reply=safe_reply,
+        human_review_required=human_review,
         confidence=confidence,
         reason_codes=reason_codes,
     )
