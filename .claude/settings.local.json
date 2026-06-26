@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(New-Item -ItemType Directory -Force \"F:\\\\SUST Codex Hackathon\\\\mainProject\\\\queuestorm\")",
+      "PowerShell(python --version)",
+      "PowerShell(py --version 2>$null)",
+      "PowerShell(& \"F:\\\\SUST Codex Hackathon\\\\mainProject\\\\queuestorm\\\\.venv\\\\Scripts\\\\python.exe\" -m pip install -r \"F:\\\\SUST Codex Hackathon\\\\mainProject\\\\queuestorm\\\\requirements.txt\" --disable-pip-version-check)",
+      "PowerShell($env:PYTHONPATH=\"F:\\\\SUST Codex Hackathon\\\\mainProject\\\\queuestorm\"; & \"F:\\\\SUST Codex Hackathon\\\\mainProject\\\\queuestorm\\\\.venv\\\\Scripts\\\\python.exe\" -c \"import main; print\\('IMPORT OK -', main.app.title, main.app.version\\)\")",
+      "PowerShell(& \"F:\\\\SUST Codex Hackathon\\\\mainProject\\\\queuestorm\\\\.venv\\\\Scripts\\\\python.exe\" -m uvicorn main:app --app-dir \"F:\\\\SUST Codex Hackathon\\\\mainProject\\\\queuestorm\" --host 0.0.0.0 --port 8000)",
+      "PowerShell(Remove-Item \"F:\\\\SUST Codex Hackathon\\\\mainProject\\\\queuestorm\\\\_verify_phase2.py\" -Force; if \\(-not \\(Test-Path \"F:\\\\SUST Codex Hackathon\\\\mainProject\\\\queuestorm\\\\_verify_phase2.py\"\\)\\) { Write-Output \"cleaned up _verify_phase2.py\" })",
+      "PowerShell(Remove-Item \"F:\\\\SUST Codex Hackathon\\\\mainProject\\\\queuestorm\\\\_verify_phase3.py\" -Force; if \\(-not \\(Test-Path \"F:\\\\SUST Codex Hackathon\\\\mainProject\\\\queuestorm\\\\_verify_phase3.py\"\\)\\) { Write-Output \"cleaned up _verify_phase3.py\" })",
+      "PowerShell(Remove-Item \"F:\\\\SUST Codex Hackathon\\\\mainProject\\\\queuestorm\\\\_verify_phase4.py\" -Force; if \\(-not \\(Test-Path \"F:\\\\SUST Codex Hackathon\\\\mainProject\\\\queuestorm\\\\_verify_phase4.py\"\\)\\) { Write-Output \"cleaned up _verify_phase4.py\" })",
+      "PowerShell(Remove-Item \"F:\\\\SUST Codex Hackathon\\\\mainProject\\\\queuestorm\\\\_verify_phase5.py\" -Force; if \\(-not \\(Test-Path \"F:\\\\SUST Codex Hackathon\\\\mainProject\\\\queuestorm\\\\_verify_phase5.py\"\\)\\) { Write-Output \"cleaned up _verify_phase5.py\" })",
+      "PowerShell(Remove-Item \"F:\\\\SUST Codex Hackathon\\\\mainProject\\\\queuestorm\\\\_verify_phase_safety.py\" -Force; if \\(-not \\(Test-Path \"F:\\\\SUST Codex Hackathon\\\\mainProject\\\\queuestorm\\\\_verify_phase_safety.py\"\\)\\) { Write-Output \"cleaned up _verify_phase_safety.py\" })"
+    ]
+  }
+}
