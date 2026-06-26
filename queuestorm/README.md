@@ -273,3 +273,27 @@ amounts).
 **Local:** put these in `queuestorm/.env` (gitignored — never committed).
 **Railway:** set them in the service's **Variables** tab (do not use a `.env`
 file in production).
+
+---
+
+## Deploy to Railway
+
+The repository's app lives in the `queuestorm/` subdirectory, and a
+`railway.json` there pins the Docker build and a `/health` healthcheck.
+
+1. **New Project → Deploy from GitHub repo**, pick this repo and the `main` branch.
+2. Open the service → **Settings → Build** and set **Root Directory** to
+   `queuestorm`. (This is the one required setting — it makes Railway find
+   `queuestorm/Dockerfile` and `queuestorm/railway.json`.)
+3. **Settings → Variables**: add `GROQ_API_KEY = gsk_…`. Do **not** set `PORT` —
+   Railway injects it automatically and the container honors `${PORT}`.
+4. Deploy. Railway builds the Dockerfile (`python:3.11-slim`, no secrets, no model
+   weights) and runs `uvicorn main:app --host 0.0.0.0 --port ${PORT}`.
+5. Once live, verify:
+
+   ```bash
+   curl https://<your-app>.up.railway.app/health        # -> {"status":"ok"}
+   ```
+
+The healthcheck (`/health`) and an `ON_FAILURE` restart policy are configured in
+`railway.json`, so a failed deploy won't be promoted and crashes auto-restart.
