@@ -35,11 +35,21 @@ except Exception:  # pragma: no cover - run standalone without the package on pa
 # --------------------------------------------------------------------------- #
 # HTTP helper                                                                  #
 # --------------------------------------------------------------------------- #
+# Transient-failure retries. A free-tier host (Render/etc.) can briefly return a
+# platform 404 ("no-server" routing) or drop the connection between requests.
+# This app never legitimately returns 404 (only /health and /analyze-ticket, and
+# the tests hit valid paths), so a 404 or connection error is always transient and
+# safe to retry — it never masks a real app status (200/400/422).
+_RETRIES = 4
+_RETRY_BACKOFF = 2.5  # seconds
+
+
 def request(path, data=None, raw=None, method="POST", timeout=35):
     """POST to the service. Returns (status, parsed_json_or_None, raw_text, seconds).
 
     `data` is JSON-encoded; `raw` is sent as-is (for the malformed-body test).
-    HTTP error statuses (4xx/5xx) are captured, not raised.
+    HTTP error statuses (4xx/5xx) are captured, not raised. Transient platform
+    404s and connection errors are retried; `seconds` reflects the final attempt.
     """
     url = BASE_URL + path
     if raw is not None:
@@ -48,15 +58,25 @@ def request(path, data=None, raw=None, method="POST", timeout=35):
         body = json.dumps(data).encode("utf-8")  # ensure_ascii keeps Bangla transport-safe
     else:
         body = None
-    req = urllib.request.Request(url, data=body, method=method)
-    req.add_header("Content-Type", "application/json")
-    start = time.time()
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            status, text = resp.getcode(), resp.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        status, text = e.code, e.read().decode("utf-8")
-    elapsed = time.time() - start
+
+    status, text, elapsed = None, "", 0.0
+    for attempt in range(_RETRIES):
+        req = urllib.request.Request(url, data=body, method=method)
+        req.add_header("Content-Type", "application/json")
+        start = time.time()
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                status, text = resp.getcode(), resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            status, text = e.code, e.read().decode("utf-8")
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            status, text = None, f"{type(e).__name__}: {e}"
+        elapsed = time.time() - start
+        if (status == 404 or status is None) and attempt < _RETRIES - 1:
+            time.sleep(_RETRY_BACKOFF)  # transient platform blip — retry
+            continue
+        break
+
     try:
         parsed = json.loads(text)
     except Exception:
